@@ -10,6 +10,7 @@
 2. [XDS en ztunnel: Estado Actual](#2-xds-en-ztunnel-estado-actual)
 3. [Configuración TLS en ztunnel: Estado Actual](#3-configuración-tls-en-ztunnel-estado-actual)
 4. [Cambios Necesarios para TLS-por-XDS](#4-cambios-necesarios-para-tls-por-xds)
+5. [Estado del Ecosistema: Upstream, Issues y el PR del Operador](#5-estado-del-ecosistema-upstream-issues-y-el-pr-del-operador)
 
 ---
 
@@ -1383,6 +1384,286 @@ Un cambio en ztunnel que suscribe a un nuevo tipo XDS sin que istiod lo genere n
 2. Populose desde `MeshConfig.TLSConfig`
 
 Los reviewers de ztunnel probablemente preguntarán "¿cómo se genera este recurso en el control plane?" — debes tener la respuesta preparada, aunque el PR de istiod sea separado.
+
+---
+
+## 5. Estado del Ecosistema: Upstream, Issues y el PR del Operador
+
+Esta sección documenta el estado actual del problema en el ecosistema Istio/OpenShift, para tener el contexto completo antes de implementar el cambio.
+
+### 5.1 ¿Existe ya un Mecanismo XDS para TLS Config en ztunnel?
+
+**Respuesta corta: No.** El análisis del repositorio de Istio confirma que no existe ningún mecanismo actual para enviar configuración TLS desde istiod a ztunnel via XDS.
+
+Los generadores XDS registrados en istiod para ztunnel son exactamente estos cuatro (en `pilot/pkg/bootstrap/discovery.go`):
+
+```go
+// pilot/pkg/bootstrap/discovery.go
+generators[v3.ProxyConfigType]           = &xds.PcdsGenerator{TrustBundle: env.TrustBundle}
+generators[v3.AddressType]               = workloadGen   // workload.Address
+generators[v3.WorkloadType]              = workloadGen   // workload.Workload
+generators[v3.WorkloadAuthorizationType] = &xds.WorkloadRBACGenerator{Server: s}
+```
+
+| Recurso XDS             | Type URL                               | ¿Lleva config TLS?                                               |
+| ----------------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| `ProxyConfig` (PCDS)    | `istio.mesh.v1alpha1.ProxyConfig`      | Solo CA certificates (`CaCertificatesPem`), **no cipher suites** |
+| `Address`               | `istio.workload.Address`               | No                                                               |
+| `Workload`              | `istio.workload.Workload`              | No                                                               |
+| `WorkloadAuthorization` | `istio.workload.WorkloadAuthorization` | No                                                               |
+
+### 5.2 El PCDS: Un TODO Explícito en el Código de Istiod
+
+El PCDS (Proxy Configuration Discovery Service) es el candidato más cercano a un mecanismo de configuración global para ztunnel. Su implementación en istiod está en `pilot/pkg/xds/pcds.go`:
+
+```go
+// pilot/pkg/xds/pcds.go:55-68
+// Generate returns ProxyConfig protobuf containing TrustBundle for given proxy
+func (e *PcdsGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
+    if !pcdsNeedsPush(req) {
+        return nil, model.DefaultXdsLogDetails, nil
+    }
+    if e.TrustBundle == nil {
+        return nil, model.DefaultXdsLogDetails, nil
+    }
+    // TODO: For now, only TrustBundle updates are pushed.
+    // Eventually, this should push entire Proxy Configuration
+    pc := &mesh.ProxyConfig{
+        CaCertificatesPem: e.TrustBundle.GetTrustBundle(),
+    }
+    return model.Resources{...}, model.DefaultXdsLogDetails, nil
+}
+```
+
+El comentario `// TODO: For now, only TrustBundle updates are pushed. Eventually, this should push entire Proxy Configuration` indica que los maintainers de Istio ya contemplan extender este mecanismo, pero no hay ningún trabajo activo en esa dirección.
+
+**Además, hay dos problemas con PCDS para nuestro caso de uso:**
+
+1. **Está condicionado a `features.MultiRootMesh`**: PCDS solo hace push si está activa la feature de multi-root mesh. No es un canal general de configuración.
+
+2. **`ProxyConfig` es el proto de configuración de Envoy**, no de ztunnel. Extenderlo para TLS de ztunnel mezclaría conceptos y sería difícil de justificar ante los reviewers upstream.
+
+### 5.3 `meshConfig.tlsDefaults`: Solo para Envoy, No para ztunnel
+
+La config `meshConfig.tlsDefaults` (y `meshConfig.meshMTLS`) sí se propaga desde istiod a los proxies Envoy en modo sidecar, pero **no tiene ningún efecto sobre ztunnel**. Las funciones que la aplican viven en el código de generación de xDS para Envoy:
+
+```go
+// pilot/pkg/networking/core/cluster_tls.go:261-272
+// Solo para Envoy/sidecar - ztunnel no pasa por esta función
+func applyTLSDefaults(tlsContext *tlsv3.UpstreamTlsContext,
+                      tlsDefaults *v1alpha1.MeshConfig_TLSConfig) {
+    if len(tlsDefaults.EcdhCurves) > 0 {
+        tlsContext.CommonTlsContext.TlsParams.EcdhCurves = tlsDefaults.EcdhCurves
+    }
+    if len(tlsDefaults.CipherSuites) > 0 {
+        tlsContext.CommonTlsContext.TlsParams.CipherSuites = tlsDefaults.CipherSuites
+    }
+}
+```
+
+Ztunnel no genera ni consume `UpstreamTlsContext` de Envoy — maneja su TLS directamente en Rust con rustls.
+
+### 5.4 Issues Relevantes en GitHub
+
+#### 5.4.1 ztunnel Issue #21: "Tune TLS settings"
+
+**URL:** https://github.com/istio/ztunnel/issues/21
+**Estado:** Abierto desde noviembre 2022
+
+Este es el issue más directamente relacionado. La discusión revela la posición del proyecto:
+
+- El issue original pedía "usar un cipher set estricto y solo TLS 1.3"
+- Un contribuidor preguntó: "¿Debería ser configurable o estático?"
+- `@howardjohn` (maintainer principal) respondió que es complejo y necesita revisión experta
+- El issue sigue abierto sin resolución — la configuración TLS en ztunnel nunca ha sido explícitamente diseñada para ser dinámica
+
+**Relevancia:** Confirma que el tema de "configurar TLS en ztunnel" es territorio inexplorado upstream y que un PR bien motivado sería bienvenido.
+
+#### 5.4.2 istio Issue #52926: "Update FIPS compliance mode to allow TLS 1.3"
+
+**URL:** https://github.com/istio/istio/issues/52926
+**Estado:** Abierto, con actividad reciente (enero 2026)
+
+Este issue es **muy relevante** porque toca el mismo problema desde otro ángulo:
+
+- El problema: el modo FIPS de Istio actualmente fuerza TLS 1.2 máximo, pero TLS 1.3 también es FIPS-compatible con el nuevo módulo boringcrypto validado
+- Comentario clave de `@gil-tohar-cyera` (febrero 2025):
+  > "Without this, Istio Ambient Mode cannot be used with FIPS, since ztunnel requires TLS 1.3"
+- Respuesta de `@howardjohn`:
+  > "We (Solo.io) have FIPS ambient builds if you are interested" — lo que implica que la solución upstream aún no existe
+
+**Relevancia directa para nuestro trabajo:** Este issue demuestra que hay demanda real de configurar la versión TLS de ztunnel dinámicamente. Un PR que permita configurar TLS via XDS resolvería también el problema del issue #52926.
+
+#### 5.4.3 istio PR #58452 (WIP): "Add fips-140-3 compliance policy"
+
+**URL:** https://github.com/istio/istio/pull/58452
+**Estado:** Abierto (WIP), solo modifica istiod/Envoy, **no toca ztunnel**
+
+Este PR añade una nueva `COMPLIANCE_POLICY=fips-140-3` para istiod y Envoy pero **no implementa nada para ztunnel**. Confirma que la estrategia actual upstream es:
+
+- Controlar TLS de ztunnel mediante `COMPLIANCE_POLICY` como variable de entorno (compilación/despliegue)
+- No existe todavía un mecanismo dinámico vía XDS
+
+#### 5.4.4 ztunnel Issue #1323: "tls-rustls-aws-lc-sys-fips build option"
+
+**URL:** https://github.com/istio/ztunnel/issues/1323
+**Estado:** Abierto
+
+Debate sobre añadir un nuevo backend criptográfico (aws-lc con FIPS) a ztunnel. `@howardjohn` menciona explícitamente:
+
+> "One wrinkle around FIPS and ztunnel in general is wrt https://github.com/istio/istio/issues/52926"
+
+Confirma que la posición actual del proyecto es que la configuración TLS de ztunnel es un **tema pendiente y no resuelto** upstream.
+
+### 5.5 El PR del Operador: sail-operator #1513
+
+**URL:** https://github.com/istio-ecosystem/sail-operator/pull/1513
+**Título:** "Add operator TLSConfig and sync with APIServer TLS profile on OpenShift"
+**Estado:** Abierto, en hold (`do-not-merge/hold`)
+
+Este PR es el **primer eslabón de la cadena** OpenShift → ztunnel. Implementa la capa del operador:
+
+#### Lo que hace el PR
+
+```mermaid
+flowchart LR
+    OS["OpenShift ApiServer\napiserver.config.openshift.io/v1\nspec.tlsSecurityProfile"]
+    SA["sail-operator\n(este PR)"]
+    IS["istiod\nvía Helm values"]
+    ENV["Envoy sidecars\nmeshConfig.tlsDefaults ✅"]
+    ZT["ztunnel ❌\nNo llega nada"]
+
+    OS -->|"FetchAPIServerTLSProfile()\nbiblioteca openshift/controller-runtime-common"| SA
+    SA -->|"meshConfig.tlsDefaults.cipherSuites\nmeshConfig.meshMTLS.cipherSuites\n--tls-cipher-suites (pilot arg)"| IS
+    IS --> ENV
+    IS -.->|"No existe mecanismo XDS"| ZT
+```
+
+**Flujo técnico del PR:**
+
+1. **Al arrancar** (solo en OpenShift), lee el TLS profile del ApiServer de OpenShift usando `openshifttls.FetchAPIServerTLSProfile()` de la librería `github.com/openshift/controller-runtime-common`. Esta librería ya encapsula toda la lógica de leer `apiserver.config.openshift.io/v1`.
+
+2. **Convierte** el `TLSProfileSpec` de OpenShift a un `config.TLSConfig{CipherSuites []uint16}` interno y lo propaga a istiod vía tres Helm values:
+   - `meshConfig.tlsDefaults.cipherSuites` — para tráfico Envoy general
+   - `meshConfig.meshMTLS.cipherSuites` — para mTLS mesh entre sidecars
+   - `pilot.extraContainerArgs: ["--tls-cipher-suites=..."]` — para el propio proceso de istiod
+
+3. **Vigila cambios** en el TLS profile mediante `SecurityProfileWatcher`. Cuando el perfil cambia, el operador **se reinicia** en lugar de hacer hot-reload:
+
+   ```go
+   OnProfileChange: func(oldProfile, newProfile configv1.TLSProfileSpec) {
+       shutdown()  // Reinicia el proceso del operador
+   }
+   ```
+
+4. **Aplica TLS al metrics server** del operador usando la misma librería de OpenShift.
+
+#### Lo que el PR NO hace (y es el gap que hay que cubrir)
+
+```
+✅ Lee TLSSecurityProfile de OpenShift ApiServer
+✅ Propaga cipher suites a istiod via Helm
+✅ Configura el metrics server del operador
+✅ Vigila cambios en el perfil
+
+❌ Propaga la config TLS a ztunnel
+❌ Define mecanismo XDS para ztunnel
+❌ Configura TLS min/max version (solo cipher suites)
+❌ Cubre la versión TLS mínima/máxima (TLSConfig solo tiene CipherSuites []uint16)
+```
+
+#### Por qué está en hold
+
+El autor pone el PR en hold con este comentario:
+
+> "Until there's more clarity on how operators should behave when `tlsStrictAdherence=LegacyExternalAPIServerComponentsOnly`. If there's not some kind of gating mechanism for this behavior in OpenShift then we'll probably want to add it in the operator."
+
+`tlsStrictAdherence` es una feature de OpenShift 4.17+ que controla si la adhesión estricta al TLS profile del ApiServer aplica a **todos** los componentes del cluster o solo a algunos. Esto es relevante porque si `tlsStrictAdherence=LegacyExternalAPIServerComponentsOnly`, podría no ser necesario aplicar el TLS profile de OpenShift a ztunnel.
+
+#### Una Limitación Notable del PR
+
+El `TLSConfig` interno del operador solo lleva `CipherSuites []uint16`:
+
+```go
+// pkg/config/config.go
+type TLSConfig struct {
+    CipherSuites []uint16  // Solo cipher suites, SIN versión TLS min/max
+}
+```
+
+Para el cambio en ztunnel, también necesitaremos al menos la versión mínima de TLS (`min_protocol_version`). Esto significa que **la cadena completa requerirá extender** el `TLSConfig` del operador para incluir `MinVersion` y potencialmente `MaxVersion`.
+
+### 5.6 Mapa Completo del Estado Actual y los Gaps
+
+```mermaid
+flowchart TD
+    subgraph "OpenShift"
+        OAS["ApiServer\nspec.tlsSecurityProfile\n(Old/Intermediate/Modern/Custom)"]
+    end
+
+    subgraph "Operador (sail-operator #1513)"
+        direction LR
+        FETCH["FetchAPIServerTLSProfile()"]
+        WATCH["SecurityProfileWatcher\n(reinicia al cambiar)"]
+        TLSCFG["TLSConfig{CipherSuites}"]
+    end
+
+    subgraph "istiod"
+        MC["MeshConfig\ntlsDefaults\nmeshMTLS"]
+        PILOT["pilot process\n--tls-cipher-suites"]
+        XDS["XDS Server"]
+    end
+
+    subgraph "Data Plane"
+        ENVOY["Envoy sidecars\nmeshConfig.tlsDefaults ✅"]
+        ZTUNNEL["ztunnel\nSin config TLS dinámica ❌"]
+    end
+
+    OAS --> FETCH
+    FETCH --> TLSCFG
+    TLSCFG --> MC
+    TLSCFG --> PILOT
+    MC --> XDS
+    XDS -->|"LDS/CDS/TLS Context\nEnvoy xDS"| ENVOY
+    XDS -.->|"❌ No existe\nMeshTLSConfig resource"| ZTUNNEL
+
+    style ZTUNNEL fill:#ffcccc,stroke:#cc0000
+    style ENVOY fill:#ccffcc,stroke:#006600
+```
+
+**Gaps identificados:**
+
+| Gap       | Descripción                                                     | Dónde implementar            |
+| --------- | --------------------------------------------------------------- | ---------------------------- |
+| **Gap 1** | istiod no genera ningún recurso XDS con config TLS para ztunnel | istiod (nuevo generador XDS) |
+| **Gap 2** | ztunnel no se suscribe a ningún recurso XDS de config TLS       | **ztunnel** (este cambio)    |
+| **Gap 3** | El proto `workload.proto` no tiene mensaje `MeshTLSConfig`      | workload.proto (shared)      |
+| **Gap 4** | `TLSConfig` del operador no incluye `min_protocol_version`      | sail-operator                |
+
+### 5.7 Implicaciones para la Estrategia de Implementación
+
+El hecho de que no exista ningún trabajo upstream en esta dirección tiene implicaciones importantes:
+
+**1. El PR de ztunnel va primero o en paralelo con istiod**
+
+Dado que no hay ningún generador XDS en istiod para este recurso, hay dos opciones:
+
+- Desarrollar el cambio de ztunnel **solo** (suscribirse a un tipo XDS que nadie genera aún, para demostrar que funciona con un generador de prueba)
+- Desarrollar **en paralelo** el generador en istiod y el handler en ztunnel, y presentar ambos PRs juntos
+
+Para upstream, la segunda opción es mucho más convincente porque los reviewers podrán ver el end-to-end funcionando.
+
+**2. El issue #52926 de Istio es un aliado**
+
+Al proponer el cambio upstream, mencionar que la feature resuelve el issue #52926 ("Ambient Mode cannot be used with FIPS") le da contexto de motivación a los reviewers. No necesitas mencionar OpenShift; el caso FIPS es suficiente motivación por sí mismo.
+
+**3. El PR del operador #1513 es el prerequisito downstream**
+
+Para el caso OpenShift específico, el flujo completo requiere que el PR #1513 del operador (o algo equivalente) esté merged primero, para que istiod reciba la config TLS del perfil OpenShift. Luego, istiod puede propagarla a ztunnel via el nuevo recurso XDS.
+
+**4. La librería `openshift/controller-runtime-common` ya resuelve la lectura del TLS profile**
+
+Para la parte del operador que lee el TLS profile de OpenShift, la librería ya existe y funciona. No hay que reinventar esa parte.
 
 ---
 
