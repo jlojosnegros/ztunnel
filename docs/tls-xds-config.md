@@ -601,7 +601,77 @@ async fn control_plane_client_config(
 }
 ```
 
-### 3.6 Diagrama: Flujo Completo TLS en una Conexión Inbound
+### 3.6 El `ProxyConfig` de `src/config.rs`: ¿Ya Lee ztunnel el MeshConfig?
+
+Existe un detalle importante que puede llevar a confusión: ztunnel **sí** lee parcialmente el MeshConfig de Istio, pero no lee de él ningún parámetro TLS. Conviene entender exactamente qué hace y qué no hace este mecanismo, porque podría parecer que ofrece una vía alternativa para propagar configuración TLS.
+
+#### Qué es el `ProxyConfig` de ztunnel
+
+En `src/config.rs:924-932` existe una struct `ProxyConfig` local de ztunnel:
+
+```rust
+// src/config.rs:924-932
+#[derive(serde::Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    pub discovery_address: Option<String>,   // dónde está istiod
+    pub proxy_admin_port:  Option<u16>,      // puerto de administración
+    pub stats_port:        Option<u16>,      // puerto de métricas
+    pub concurrency:       Option<u16>,      // worker threads
+    pub proxy_metadata:    HashMap<String, String>,
+}
+```
+
+**No hay ningún campo TLS.** Esta struct es exclusivamente para configuración operacional del proxy.
+
+También existe el wrapper `MeshConfig` que la envuelve (`src/config.rs:918-922`):
+
+```rust
+// src/config.rs:918-922
+#[derive(serde::Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshConfig {
+    pub default_config: Option<ProxyConfig>,
+}
+```
+
+#### De dónde vienen los datos
+
+La función `construct_proxy_config()` (`src/config.rs:945-1001`) las fusiona desde tres fuentes:
+
+```mermaid
+flowchart LR
+    F["Fichero\n./etc/istio/config/mesh\n(ConfigMap 'istio' montado)"]
+    E["Env var\nPROXY_CONFIG\n(YAML)"]
+    M["Env vars\nISTIO_META_*"]
+    PC["ProxyConfig\n(solo campos operacionales:\ndiscoveryAddress, ports,\nconcurrency, metadata)"]
+
+    F -->|"MeshConfig.defaultConfig"| PC
+    E -->|"Sobreescribe"| PC
+    M -->|"proxy_metadata"| PC
+```
+
+El fichero `./etc/istio/config/mesh` es el ConfigMap `istio` del namespace `istio-system` montado como volumen en el pod de ztunnel. Contiene el MeshConfig completo de Istio en formato YAML, pero ztunnel **solo deserializa el campo `defaultConfig`** y de él solo los cinco campos arriba listados.
+
+#### Por qué este mecanismo no sirve para TLS
+
+Este mecanismo tiene dos limitaciones fundamentales para el problema que queremos resolver:
+
+1. **No incluye campos TLS.** El MeshConfig de Istio sí tiene `tlsDefaults`, `meshMTLS` y otros campos TLS en su proto, pero el `ProxyConfig` de ztunnel no los deserializa. Ampliar la struct para incluirlos sería posible, pero llevaría al segundo problema.
+
+2. **Es estático: se lee una sola vez al arrancar.** La función `parse_proxy_config()` se llama desde `parse_config()` al inicio del proceso. No hay ningún mecanismo de file-watching ni recarga en caliente. Si el ConfigMap cambia, ztunnel no se entera sin reiniciarse — exactamente el problema que queremos solucionar.
+
+#### Comparación con el enfoque XDS propuesto
+
+| Mecanismo | Datos disponibles | Actualización en caliente | ACK/NACK |
+|-----------|------------------|--------------------------|----------|
+| Fichero ConfigMap (actual) | Solo operacional (puertos, concurrency...) | No — requiere restart | No |
+| Fichero ConfigMap extendido | Se podrían añadir campos TLS | No — sigue requiriendo restart | No |
+| **Nuevo recurso XDS (propuesta)** | **TLS profile completo** | **Sí — en tiempo real** | **Sí** |
+
+Extender el `ProxyConfig` del fichero para incluir TLS resolvería el problema de "configuración centralizada", pero no el de "sin reinicio". El enfoque XDS resuelve ambos a la vez y es consistente con cómo ya funciona el resto de la configuración dinámica de ztunnel.
+
+### 3.7 Diagrama: Flujo Completo TLS en una Conexión Inbound
 
 ```mermaid
 sequenceDiagram
@@ -629,7 +699,7 @@ sequenceDiagram
     Note over ZT1,ZT2: HTTP/2 sobre mTLS (HBONE)
 ```
 
-### 3.7 Resumen de lo Hardcodeado
+### 3.8 Resumen de lo Hardcodeado
 
 | Parámetro               | Valor Actual                                             | Dónde                            | ¿Configurable?             |
 | ----------------------- | -------------------------------------------------------- | -------------------------------- | -------------------------- |
