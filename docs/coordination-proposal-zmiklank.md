@@ -1,23 +1,20 @@
 # Proposal: Dynamic TLS Profile Configuration for ztunnel via XDS
 
 **To:** Zuzana Miklánková (@zmiklank)
-**Context:** Coordination before opening a GitHub issue upstream
+**Context:** Design proposal — follow-up to our meeting with Nick
 
 Hi Zuzana,
 
-Nick mentioned you have been thinking about extending `meshConfig.tlsDefaults`
-support to ztunnel. I have been working on a design for exactly that problem —
-triggered by the need to propagate the OpenShift `TLSSecurityProfile` from
-`apiserver.config.openshift.io/v1` all the way down to ztunnel — and I wanted
-to share my approach with you before opening anything upstream, to make sure
-we align and do not duplicate work.
+As promised in our meeting, here is the design I have been working on for
+making ztunnel's TLS configuration dynamic via XDS. Since we are both looking
+at this from the same angle, I wanted to write everything up properly so we
+can discuss the specifics and decide how to move forward together.
 
-I know you have been the primary driver of TLS improvements in ztunnel
-(#1711, #1743) and in the sail-operator (#1547, #1606), so your perspective
-here is going to be essential.
+Your work on #1711 and #1743 is the direct foundation for this — this proposal
+is essentially the next step on top of what you already put in place.
 
-Please treat this document as a starting point for a conversation rather than
-a finished proposal.
+Please treat this as a working document, not a finished proposal — I am
+expecting your input to change parts of it.
 
 ---
 
@@ -291,48 +288,48 @@ hard selection — so the two changes should compose cleanly.
 
 ## 5. Open questions for your input
 
-I would really appreciate your thoughts on the following before moving forward:
+These are the points where I am genuinely uncertain and your take will shape
+the final design:
 
-1. **Are you already working on something similar?**
-   Nick mentioned you were thinking about extending `meshConfig.tlsDefaults`
-   to ztunnel. Do you have a different approach in mind, or a design doc
-   I should read first?
-
-2. **Is the proto placement right?**
+1. **Is the proto placement right?**
    I put `MeshTLSConfig` in `workload.proto` (package `istio.workload`) to keep
-   it consistent with `Address`. Would you expect it somewhere else, for example
-   a new `mesh.proto` or as an extension to the existing `MeshConfig` proto?
+   it consistent with `Address`. Would you place it somewhere else — for example
+   a new `mesh.proto`, or as an extension to the existing `MeshConfig` proto in
+   the istio-api repo?
 
-3. **Singleton vs. per-proxy resource?**
+2. **Singleton vs. per-proxy resource?**
    I modelled this as a singleton (one resource per mesh, key = mesh name).
-   Is there a case where different ztunnel nodes should get different TLS
-   profiles? I cannot think of one, but you might.
+   Is there any scenario where different ztunnel nodes should receive different
+   TLS profiles? I cannot think of one, but I want to make sure.
 
-4. **Handler validation: how strict?**
-   The handler sends an XDS NACK if the profile is invalid (e.g., `min > max`,
-   or the resulting filtered cipher list is empty). Is that the right failure
-   mode, or should ztunnel log and fall back to defaults silently instead?
+3. **Handler validation: how strict?**
+   The handler NACKs if the profile is semantically invalid (e.g., `min > max`,
+   or the filtered cipher list ends up empty after intersecting with the compiled
+   provider). Is NACK the right failure mode here, or should ztunnel log and
+   fall back to defaults silently? I lean toward NACK so operators have
+   visibility, but it is a trade-off.
 
-5. **Scope of the first PR?**
-   Would you split this into smaller PRs (proto first, then handler, then
-   application to `server_config`/`client_config`) or land it as a single
-   coherent change? The project preference for bite-sized PRs suggests splitting,
-   but the feature is not observable until all pieces are in place.
+4. **Scope of the first PR?**
+   The project prefers bite-sized PRs. I was thinking of splitting this into:
+   proto + type URL → store + handler → application to `lib.rs` + `certificate.rs`.
+   But the feature is not observable until all three are merged. What would you do?
 
-6. **Coordination with sail-operator PR #1513?**
-   That PR is currently on hold due to `tlsStrictAdherence` uncertainty. Does
-   the ztunnel change depend on that PR being resolved first, or can it be
-   developed and merged independently?
+5. **Coordination with sail-operator PR #1513?**
+   That PR is still on hold due to `tlsStrictAdherence`. Does the ztunnel
+   change need to wait for it, or can we develop and propose it independently?
+   My instinct is to keep them decoupled — the ztunnel change is useful beyond
+   the OpenShift use case anyway.
 
 ---
 
 ## 6. Suggested next steps
 
-- **If you already have a design**: share it and let's see if we can converge.
-- **If you are just at the thinking stage**: would you be willing to co-author
-  the upstream GitHub issue? Having two contributors with ztunnel history behind
-  the proposal would help it land.
-- **If your plan is substantially different**: let us discuss the trade-offs
-  before either of us opens anything public.
+Given that we are both looking at this and neither of us has started coding yet,
+it makes sense to align on the design first and then work on it together.
 
-Happy to jump on a call or continue async — whichever works best for you.
+A concrete proposal: would you be willing to co-author the upstream GitHub
+issue? Having both of us behind it — with your track record in ztunnel (#1711,
+#1743) — will carry a lot more weight with the maintainers than a solo proposal
+from someone new to the codebase.
+
+Happy to continue async or jump on a call — whichever works for you.
