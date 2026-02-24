@@ -1,20 +1,20 @@
 # Proposal: Dynamic TLS Profile Configuration for ztunnel via XDS
 
 **To:** Zuzana Miklánková (@zmiklank)
-**Context:** Design proposal — follow-up to our meeting with Nick
+**Context:** Follow-up to our meeting with Nick — design analysis for your review
 
 Hi Zuzana,
 
-As promised in our meeting, here is the design I have been working on for
-making ztunnel's TLS configuration dynamic via XDS. Since we are both looking
-at this from the same angle, I wanted to write everything up properly so we
-can discuss the specifics and decide how to move forward together.
+After our meeting I spent some time going deep into the ztunnel and istiod
+codebases to map out exactly what would need to change to make ztunnel's TLS
+configuration dynamic via XDS. I am writing this up so you have something
+concrete to react to, and so that whatever direction you decide to take, the
+analysis might save you some time.
 
-Your work on #1711 and #1743 is the direct foundation for this — this proposal
-is essentially the next step on top of what you already put in place.
-
-Please treat this as a working document, not a finished proposal — I am
-expecting your input to change parts of it.
+This is entirely yours to use, ignore or redirect as you see fit — I just
+thought it would be more useful to show up with a documented proposal than with
+vague ideas, and I am keen to help with the work in whatever way is most
+useful to you.
 
 ---
 
@@ -59,10 +59,10 @@ work to propagate OpenShift's `TLSSecurityProfile`.
 For context, ztunnel currently subscribes to exactly two XDS resource types
 (`src/xds/types.rs`):
 
-| Type URL | Purpose |
-|---|---|
-| `type.googleapis.com/istio.workload.Address` | Workload and service data |
-| `type.googleapis.com/istio.security.Authorization` | RBAC policies |
+| Type URL                                           | Purpose                   |
+| -------------------------------------------------- | ------------------------- |
+| `type.googleapis.com/istio.workload.Address`       | Workload and service data |
+| `type.googleapis.com/istio.security.Authorization` | RBAC policies             |
 
 There is no mechanism for istiod to push global mesh configuration — TLS
 settings included — to ztunnel via XDS today.
@@ -79,11 +79,11 @@ already established by `Address` and `Authorization`.
 
 Before proposing this, I evaluated three other options:
 
-| Option | Problem |
-|---|---|
-| Extend PCDS (`ProxyConfig`) | Gated on `features.MultiRootMesh`; `ProxyConfig` is an Envoy-specific proto conceptually wrong for ztunnel mesh config |
+| Option                                    | Problem                                                                                                                         |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Extend PCDS (`ProxyConfig`)               | Gated on `features.MultiRootMesh`; `ProxyConfig` is an Envoy-specific proto conceptually wrong for ztunnel mesh config          |
 | `Extension` field on `Workload`/`Service` | TLS profile is global, not per-workload; embedding it in every workload resource wastes bandwidth and is semantically incorrect |
-| Continue using env vars | Cannot be updated at runtime; is exactly the problem |
+| Continue using env vars                   | Cannot be updated at runtime; is exactly the problem                                                                            |
 
 A dedicated resource type is independently versioned, zero-cost when unused,
 and follows the pattern reviewers already know.
@@ -272,64 +272,55 @@ so it creates a consistent API surface for both proxy types.
 ## 4. Relationship to your existing work
 
 Your PR #1711 (`add support for TLSv1.2`) introduced the `TLS12_ENABLED` env
-var as the right short-term solution ("until we have FIPS-140-3 support in
-istiod", as noted in the PR body). The proposal above is the logical next step:
-replacing that static env var with a dynamic XDS-driven mechanism, while
-keeping `TLS12_ENABLED` as the compiled-in fallback for deployments that do
-not use the new feature.
+var with the explicit note "until we have FIPS-140-3 support in istiod". This
+proposal is essentially that follow-up: replacing the static env var with a
+dynamic XDS-driven mechanism, while keeping `TLS12_ENABLED` as the compiled-in
+fallback for deployments that do not use the new feature.
 
 Your PR #1743 (OpenSSL PQC provider) adds a new crypto provider to the same
-`src/tls/lib.rs` functions that this proposal refactors (`provider()`). The
+`src/tls/lib.rs` functions this proposal refactors (`provider()`). The
 `provider_with_profile()` function would need to handle the OpenSSL provider
-the same way it handles the others — using a subset-filter approach rather than
-hard selection — so the two changes should compose cleanly.
+the same way as the others — using a subset-filter approach — so the two
+changes should compose without conflict. Worth double-checking with you though,
+since you know that code from the inside.
 
 ---
 
-## 5. Open questions for your input
+## 5. Questions where I would value your input
 
-These are the points where I am genuinely uncertain and your take will shape
-the final design:
+I made some design calls that I am not fully confident about, and you know this
+codebase much better than I do:
 
-1. **Is the proto placement right?**
-   I put `MeshTLSConfig` in `workload.proto` (package `istio.workload`) to keep
-   it consistent with `Address`. Would you place it somewhere else — for example
-   a new `mesh.proto`, or as an extension to the existing `MeshConfig` proto in
+1. **Proto placement**: I put `MeshTLSConfig` in `workload.proto`
+   (`istio.workload` package) because it follows the same pattern as `Address`.
+   Is that the right home, or would you put it somewhere else — a dedicated
+   `mesh.proto`, or as an extension to the existing `MeshConfig` proto in
    the istio-api repo?
 
-2. **Singleton vs. per-proxy resource?**
-   I modelled this as a singleton (one resource per mesh, key = mesh name).
-   Is there any scenario where different ztunnel nodes should receive different
-   TLS profiles? I cannot think of one, but I want to make sure.
+2. **Singleton modelling**: I treated this as a single resource per mesh
+   (key = mesh name). Is there any case where different ztunnel nodes should
+   receive different TLS profiles?
 
-3. **Handler validation: how strict?**
-   The handler NACKs if the profile is semantically invalid (e.g., `min > max`,
-   or the filtered cipher list ends up empty after intersecting with the compiled
-   provider). Is NACK the right failure mode here, or should ztunnel log and
-   fall back to defaults silently? I lean toward NACK so operators have
-   visibility, but it is a trade-off.
+3. **NACK vs. silent fallback**: when the received profile is invalid (e.g.,
+   `min > max`, or the filtered cipher list is empty), I have the handler
+   sending a NACK. Is that preferable, or should it log and fall back to
+   defaults silently?
 
-4. **Scope of the first PR?**
-   The project prefers bite-sized PRs. I was thinking of splitting this into:
-   proto + type URL → store + handler → application to `lib.rs` + `certificate.rs`.
-   But the feature is not observable until all three are merged. What would you do?
-
-5. **Coordination with sail-operator PR #1513?**
-   That PR is still on hold due to `tlsStrictAdherence`. Does the ztunnel
-   change need to wait for it, or can we develop and propose it independently?
-   My instinct is to keep them decoupled — the ztunnel change is useful beyond
-   the OpenShift use case anyway.
+4. **PR #1513 dependency**: the sail-operator PR is on hold due to
+   `tlsStrictAdherence`. Should the ztunnel change wait for that to resolve,
+   or is it worth proposing upstream independently given that the use case
+   is broader than OpenShift?
 
 ---
 
-## 6. Suggested next steps
+## 6. How I can help
 
-Given that we are both looking at this and neither of us has started coding yet,
-it makes sense to align on the design first and then work on it together.
+If the design looks reasonable to you and you decide to move forward with it,
+I am happy to take on whatever parts are most useful — drafting the upstream
+issue, writing tests, implementing specific pieces of the ztunnel change, or
+doing the companion istiod work. Just point me at what would be most helpful.
 
-A concrete proposal: would you be willing to co-author the upstream GitHub
-issue? Having both of us behind it — with your track record in ztunnel (#1711,
-#1743) — will carry a lot more weight with the maintainers than a solo proposal
-from someone new to the codebase.
+If the approach needs significant rethinking, I am equally happy to help
+iterate on the design before anything goes public.
 
-Happy to continue async or jump on a call — whichever works for you.
+Either way, the analysis is there for you to use as you see fit.
