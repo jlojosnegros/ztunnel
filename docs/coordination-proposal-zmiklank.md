@@ -54,9 +54,55 @@ work to propagate OpenShift's `TLSSecurityProfile`.
 
 ---
 
-## 2. Current ztunnel XDS subscriptions
+## 2. What ztunnel reads from MeshConfig today (and what it does not)
 
-For context, ztunnel currently subscribes to exactly two XDS resource types
+Nick pointed out that ztunnel does read *something* from the Istio MeshConfig —
+this is worth understanding clearly before discussing the proposed solution,
+because it might look like an existing hook we could reuse.
+
+### 2.1 The `ProxyConfig` struct in `src/config.rs`
+
+ztunnel has a local `ProxyConfig` struct (`src/config.rs:926-932`) that it
+populates at startup from three sources: the `istio` ConfigMap mounted as a
+file at `./etc/istio/config/mesh`, the `PROXY_CONFIG` environment variable,
+and any `ISTIO_META_*` environment variables:
+
+```rust
+// src/config.rs:926-932 — all operational, no TLS fields
+pub struct ProxyConfig {
+    pub discovery_address: Option<String>,
+    pub proxy_admin_port:  Option<u16>,
+    pub stats_port:        Option<u16>,
+    pub concurrency:       Option<u16>,
+    pub proxy_metadata:    HashMap<String, String>,
+}
+```
+
+The ConfigMap contains the full Istio MeshConfig YAML, but ztunnel only
+deserializes the `defaultConfig` sub-field — and from that, only the five
+operational fields above. Everything else in MeshConfig, including
+`tlsDefaults`, `meshMTLS`, cipher suite settings, and protocol versions, is
+silently ignored.
+
+### 2.2 Why this is not a viable path for TLS
+
+This file-based mechanism has two fundamental limitations for our use case:
+
+| | File-based ProxyConfig (current) | File-based + TLS fields added | XDS resource (proposed) |
+|---|---|---|---|
+| Carries TLS settings | No | Could be added | Yes |
+| Updates without restart | No | No | Yes |
+| Acknowledged updates (ACK/NACK) | No | No | Yes |
+
+Extending `ProxyConfig` with TLS fields would solve "centralised configuration"
+but not "no restart required" — because `parse_proxy_config()` is called once
+at process start with no file-watching or hot-reload. The XDS approach solves
+both at once and is consistent with how the rest of ztunnel's dynamic
+configuration already works.
+
+### 2.3 Current XDS subscriptions
+
+ztunnel currently subscribes to exactly two XDS resource types
 (`src/xds/types.rs`):
 
 | Type URL                                           | Purpose                   |

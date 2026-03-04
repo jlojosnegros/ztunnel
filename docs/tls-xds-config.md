@@ -663,11 +663,11 @@ Este mecanismo tiene dos limitaciones fundamentales para el problema que queremo
 
 #### Comparación con el enfoque XDS propuesto
 
-| Mecanismo | Datos disponibles | Actualización en caliente | ACK/NACK |
-|-----------|------------------|--------------------------|----------|
-| Fichero ConfigMap (actual) | Solo operacional (puertos, concurrency...) | No — requiere restart | No |
-| Fichero ConfigMap extendido | Se podrían añadir campos TLS | No — sigue requiriendo restart | No |
-| **Nuevo recurso XDS (propuesta)** | **TLS profile completo** | **Sí — en tiempo real** | **Sí** |
+| Mecanismo                         | Datos disponibles                          | Actualización en caliente      | ACK/NACK |
+| --------------------------------- | ------------------------------------------ | ------------------------------ | -------- |
+| Fichero ConfigMap (actual)        | Solo operacional (puertos, concurrency...) | No — requiere restart          | No       |
+| Fichero ConfigMap extendido       | Se podrían añadir campos TLS               | No — sigue requiriendo restart | No       |
+| **Nuevo recurso XDS (propuesta)** | **TLS profile completo**                   | **Sí — en tiempo real**        | **Sí**   |
 
 Extender el `ProxyConfig` del fichero para incluir TLS resolvería el problema de "configuración centralizada", pero no el de "sin reinicio". El enfoque XDS resuelve ambos a la vez y es consistente con cómo ya funciona el resto de la configuración dinámica de ztunnel.
 
